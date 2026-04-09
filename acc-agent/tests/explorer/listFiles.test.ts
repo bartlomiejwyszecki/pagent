@@ -46,4 +46,31 @@ describe("listFiles", () => {
       { path: "src/tools/index.ts", type: "file" }
     ]);
   });
+
+  it("skips files and directories ignored by .gitignore", async () => {
+    const root = await createTempRoot();
+    await mkdir(join(root, "src"), { recursive: true });
+    await mkdir(join(root, "node_modules", "pkg"), { recursive: true });
+    await writeFile(join(root, ".gitignore"), "node_modules\n", "utf8");
+    await writeFile(join(root, "src", "index.ts"), "export {};\n", "utf8");
+    await writeFile(join(root, "node_modules", "pkg", "index.ts"), "export {};\n", "utf8");
+
+    const result = await listFiles({ recursive: true }, root);
+
+    expect(result.entries).toEqual([
+      { path: "src", type: "directory" },
+      { path: "src/index.ts", type: "file" }
+    ]);
+  });
+
+  it("skips files with disallowed extensions", async () => {
+    const root = await createTempRoot();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "index.ts"), "export {};\n", "utf8");
+    await writeFile(join(root, "src", "notes.txt"), "text\n", "utf8");
+
+    const result = await listFiles({ path: "src", recursive: true }, root);
+
+    expect(result.entries).toEqual([{ path: "src/index.ts", type: "file" }]);
+  });
 });

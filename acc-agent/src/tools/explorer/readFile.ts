@@ -1,6 +1,6 @@
 import { readFile as readFileFromDisk, stat } from "node:fs/promises";
 
-import { PathGuardOptions, resolveScopedPath, toRelativeScopedPath } from "./pathGuard";
+import { ScopeManager } from "../../core/scopeManager";
 
 export interface ReadFileInput {
   path: string;
@@ -44,13 +44,18 @@ export async function readFile(
   input: ReadFileInput,
   root: string
 ): Promise<ReadFileResult> {
-  const options: PathGuardOptions = { root };
-  const targetPath = resolveScopedPath(input.path, options);
+  const scopeManager = new ScopeManager({
+    workspaceRoot: root
+  });
+
+  const targetPath = scopeManager.resolveFilePath(input.path);
   const targetStats = await stat(targetPath);
 
   if (!targetStats.isFile()) {
     throw new Error(`Path "${input.path}" is not a readable file.`);
   }
+
+  scopeManager.assertFileSizeAllowed(targetStats.size);
 
   const buffer = await readFileFromDisk(targetPath);
 
@@ -59,7 +64,8 @@ export async function readFile(
   }
 
   const fullContent = buffer.toString("utf8");
-  const lines = fullContent.split(/\r?\n/);
+  const truncatedContent = scopeManager.truncateToReadLimit(fullContent).content;
+  const lines = truncatedContent.split(/\r?\n/);
   const totalLines = lines.length;
   const requestedStartLine = normalizeLineNumber(input.startLine, 1);
   const requestedEndLine = normalizeLineNumber(input.endLine, totalLines);
@@ -73,7 +79,7 @@ export async function readFile(
   const slicedLines = lines.slice(boundedStartLine - 1, boundedEndLine);
 
   return {
-    path: toRelativeScopedPath(targetPath, options),
+    path: scopeManager.toRelativePath(targetPath),
     content: slicedLines.join("\n"),
     startLine: boundedStartLine,
     endLine: boundedEndLine,

@@ -1,4 +1,7 @@
+import { existsSync, readFileSync } from "node:fs";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
+
+import ignore, { type Ignore } from "ignore";
 
 export interface ScopeManagerOptions {
   workspaceRoot: string;
@@ -9,6 +12,9 @@ export interface ScopeManagerOptions {
   maxFileSizeBytes?: number;
   maxListResults?: number;
   maxRecursionDepth?: number;
+  respectGitIgnore?: boolean;
+  ignoreFileName?: string;
+  ignorePatterns?: string[];
 }
 
 export interface ScopePolicy {
@@ -20,6 +26,9 @@ export interface ScopePolicy {
   maxFileSizeBytes: number;
   maxListResults: number;
   maxRecursionDepth: number;
+  respectGitIgnore: boolean;
+  ignoreFileName: string;
+  ignorePatterns: string[];
 }
 
 export class ScopeViolationError extends Error {
@@ -34,6 +43,7 @@ const DEFAULT_MAX_READ_CHARS = 10_000;
 const DEFAULT_MAX_FILE_SIZE_BYTES = 256 * 1024;
 const DEFAULT_MAX_LIST_RESULTS = 500;
 const DEFAULT_MAX_RECURSION_DEPTH = 8;
+const DEFAULT_IGNORE_FILE_NAME = ".gitignore";
 
 function toPosixPath(filePath: string): string {
   return filePath.split(sep).join("/");
@@ -59,6 +69,16 @@ function normalizeExtension(extension: string): string {
   return trimmedExtension.startsWith(".") ? trimmedExtension : `.${trimmedExtension}`;
 }
 
+function normalizeIgnorePattern(pattern: string): string {
+  const trimmedPattern = pattern.trim();
+
+  if (!trimmedPattern) {
+    throw new ScopeViolationError("Ignore patterns cannot be empty.");
+  }
+
+  return toPosixPath(trimmedPattern);
+}
+
 function ensureWithinRoot(root: string, targetPath: string): void {
   const relativePath = relative(root, targetPath);
 
@@ -79,9 +99,26 @@ function containsHiddenSegment(relativePath: string): boolean {
     .some((segment) => segment.startsWith("."));
 }
 
+function loadGitIgnorePatterns(workspaceRoot: string, ignoreFileName: string): string[] {
+  const ignoreFilePath = resolve(workspaceRoot, ignoreFileName);
+
+  if (!existsSync(ignoreFilePath)) {
+    return [];
+  }
+
+  const content = readFileSync(ignoreFilePath, "utf8");
+
+  return content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .map((line) => toPosixPath(line));
+}
+
 export class ScopeManager {
   private readonly policy: ScopePolicy;
   private readonly allowedAbsoluteDirectories: string[];
+  private readonly ignoreMatcher: Ignore;
 
   constructor(options: ScopeManagerOptions) {
     const workspaceRoot = resolve(options.workspaceRoot);
@@ -98,6 +135,12 @@ export class ScopeManager {
       ? options.allowedExtensions
       : DEFAULT_ALLOWED_EXTENSIONS).map(normalizeExtension);
 
+    const ignoreFileName = options.ignoreFileName?.trim() || DEFAULT_IGNORE_FILE_NAME;
+    const explicitIgnorePatterns = (options.ignorePatterns ?? []).map(normalizeIgnorePattern);
+    const gitIgnorePatterns = options.respectGitIgnore === false
+      ? []
+      : loadGitIgnorePatterns(workspaceRoot, ignoreFileName);
+
     this.policy = {
       workspaceRoot,
       allowedDirectories,
@@ -106,7 +149,10 @@ export class ScopeManager {
       maxReadChars: options.maxReadChars ?? DEFAULT_MAX_READ_CHARS,
       maxFileSizeBytes: options.maxFileSizeBytes ?? DEFAULT_MAX_FILE_SIZE_BYTES,
       maxListResults: options.maxListResults ?? DEFAULT_MAX_LIST_RESULTS,
-      maxRecursionDepth: options.maxRecursionDepth ?? DEFAULT_MAX_RECURSION_DEPTH
+      maxRecursionDepth: options.maxRecursionDepth ?? DEFAULT_MAX_RECURSION_DEPTH,
+      respectGitIgnore: options.respectGitIgnore ?? true,
+      ignoreFileName,
+      ignorePatterns: [...gitIgnorePatterns, ...explicitIgnorePatterns]
     };
 
     this.allowedAbsoluteDirectories = allowedDirectories.map((directory) => {
@@ -114,13 +160,19 @@ export class ScopeManager {
       ensureWithinRoot(workspaceRoot, absoluteDirectory);
       return absoluteDirectory;
     });
+
+    this.ignoreMatcher = ignore();
+    if (this.policy.ignorePatterns.length > 0) {
+      this.ignoreMatcher.add(this.policy.ignorePatterns);
+    }
   }
 
   getPolicy(): ScopePolicy {
     return {
       ...this.policy,
       allowedDirectories: [...this.policy.allowedDirectories],
-      allowedExtensions: [...this.policy.allowedExtensions]
+      allowedExtensions: [...this.policy.allowedExtensions],
+      ignorePatterns: [...this.policy.ignorePatterns]
     };
   }
 
@@ -132,6 +184,8 @@ export class ScopeManager {
 
     ensureWithinRoot(this.policy.workspaceRoot, absolutePath);
     this.assertDirectoryAllowed(absolutePath);
+    this.assertPathVisible(absolutePath);
+    this.assertNotIgnored(absolutePath);
 
     return absolutePath;
   }
@@ -150,6 +204,8 @@ export class ScopeManager {
     ensureWithinRoot(this.policy.workspaceRoot, absolutePath);
     this.assertDirectoryAllowed(absolutePath);
     this.assertExtensionAllowed(absolutePath);
+    this.assertPathVisible(absolutePath);
+    this.assertNotIgnored(absolutePath);
 
     return absolutePath;
   }
@@ -168,12 +224,62 @@ export class ScopeManager {
     return containsHiddenSegment(relativePath);
   }
 
-  isPathVisible(relativePath: string): boolean {
+  isPathVisible(relativePathOrAbsolutePath: string): boolean {
+    const relativePath = this.toRelativeCandidatePath(relativePathOrAbsolutePath);
+
     if (this.policy.allowHiddenPaths) {
       return true;
     }
 
     return !this.isHiddenPath(relativePath);
+  }
+
+  isIgnored(relativePathOrAbsolutePath: string): boolean {
+    const relativePath = this.toRelativeCandidatePath(relativePathOrAbsolutePath);
+
+    if (!relativePath || relativePath === ".") {
+      return false;
+    }
+
+    return this.ignoreMatcher.ignores(relativePath);
+  }
+
+  isPathAllowed(relativePathOrAbsolutePath: string, kind: "file" | "directory"): boolean {
+    const absolutePath = this.toAbsoluteCandidatePath(relativePathOrAbsolutePath);
+
+    if (!this.isDirectoryAllowed(absolutePath)) {
+      return false;
+    }
+
+    if (!this.isPathVisible(absolutePath)) {
+      return false;
+    }
+
+    if (this.isIgnored(absolutePath)) {
+      return false;
+    }
+
+    if (kind === "file" && !this.isExtensionAllowed(absolutePath)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  assertPathVisible(relativePathOrAbsolutePath: string): void {
+    const relativePath = this.toRelativeCandidatePath(relativePathOrAbsolutePath);
+
+    if (!this.isPathVisible(relativePath)) {
+      throw new ScopeViolationError(`Path "${relativePath}" is hidden and not visible in scope.`);
+    }
+  }
+
+  assertNotIgnored(relativePathOrAbsolutePath: string): void {
+    const relativePath = this.toRelativeCandidatePath(relativePathOrAbsolutePath);
+
+    if (this.isIgnored(relativePath)) {
+      throw new ScopeViolationError(`Path "${relativePath}" is ignored by scope rules.`);
+    }
   }
 
   isExtensionAllowed(filePath: string): boolean {
@@ -247,5 +353,23 @@ export class ScopeManager {
         `Recursion depth ${depth} exceeds the maximum allowed depth of ${this.policy.maxRecursionDepth}.`
       );
     }
+  }
+
+  private toAbsoluteCandidatePath(relativePathOrAbsolutePath: string): string {
+    return isAbsolute(relativePathOrAbsolutePath)
+      ? resolve(relativePathOrAbsolutePath)
+      : resolve(this.policy.workspaceRoot, relativePathOrAbsolutePath);
+  }
+
+  private toRelativeCandidatePath(relativePathOrAbsolutePath: string): string {
+    if (!relativePathOrAbsolutePath || relativePathOrAbsolutePath === ".") {
+      return ".";
+    }
+
+    if (isAbsolute(relativePathOrAbsolutePath)) {
+      return this.toRelativePath(relativePathOrAbsolutePath);
+    }
+
+    return toPosixPath(relativePathOrAbsolutePath);
   }
 }

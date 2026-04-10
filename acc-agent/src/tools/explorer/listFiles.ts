@@ -1,5 +1,7 @@
-import { readdir } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
+
+import fg from "fast-glob";
 
 import { ScopeManager } from "../../core/scopeManager";
 
@@ -19,51 +21,45 @@ export interface ListFilesResult {
   entries: ListFilesEntry[];
 }
 
-async function walkDirectory(
-  currentPath: string,
-  scopeManager: ScopeManager,
-  recursive: boolean,
-  depth: number
-): Promise<ListFilesEntry[]> {
-  scopeManager.assertRecursionDepth(depth);
+function createGlobPattern(targetRelativePath: string, recursive: boolean): string {
+  if (targetRelativePath === ".") {
+    return recursive ? "**/*" : "*";
+  }
 
-  const dirEntries = await readdir(currentPath, { withFileTypes: true });
+  return recursive ? `${targetRelativePath}/**/*` : `${targetRelativePath}/*`;
+}
+
+async function collectEntries(
+  scopeManager: ScopeManager,
+  targetPath: string,
+  recursive: boolean
+): Promise<ListFilesEntry[]> {
+  const policy = scopeManager.getPolicy();
+  const targetRelativePath = scopeManager.toRelativePath(targetPath);
+  const pattern = createGlobPattern(targetRelativePath, recursive);
+
+  const matchedPaths = await fg(pattern, {
+    cwd: policy.workspaceRoot,
+    onlyFiles: false,
+    dot: policy.allowHiddenPaths,
+    unique: true,
+    followSymbolicLinks: false
+  });
+
   const results: ListFilesEntry[] = [];
 
-  for (const entry of dirEntries) {
-    const absoluteEntryPath = join(currentPath, entry.name);
-    const relativeEntryPath = scopeManager.toRelativePath(absoluteEntryPath);
+  for (const matchedPath of matchedPaths) {
+    const absoluteEntryPath = join(policy.workspaceRoot, matchedPath);
+    const entryStats = await stat(absoluteEntryPath);
+    const entryType: ListFilesEntry["type"] = entryStats.isDirectory() ? "directory" : "file";
 
-    if (entry.isDirectory()) {
-      if (!scopeManager.isPathAllowed(absoluteEntryPath, "directory")) {
-        continue;
-      }
-
-      results.push({
-        path: relativeEntryPath,
-        type: "directory"
-      });
-
-      if (recursive) {
-        const nestedEntries = await walkDirectory(
-          absoluteEntryPath,
-          scopeManager,
-          recursive,
-          depth + 1
-        );
-        results.push(...nestedEntries);
-      }
-
-      continue;
-    }
-
-    if (!scopeManager.isPathAllowed(absoluteEntryPath, "file")) {
+    if (!scopeManager.isPathAllowed(absoluteEntryPath, entryType)) {
       continue;
     }
 
     results.push({
-      path: relativeEntryPath,
-      type: "file"
+      path: scopeManager.toRelativePath(absoluteEntryPath),
+      type: entryType
     });
   }
 
@@ -79,7 +75,7 @@ export async function listFiles(
   });
 
   const targetPath = scopeManager.resolveDirectoryPath(input.path);
-  const entries = await walkDirectory(targetPath, scopeManager, Boolean(input.recursive), 0);
+  const entries = await collectEntries(scopeManager, targetPath, Boolean(input.recursive));
 
   entries.sort((left, right) => left.path.localeCompare(right.path));
   scopeManager.assertListResultLimit(entries.length);
